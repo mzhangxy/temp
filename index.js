@@ -124,7 +124,7 @@ function handleSsConnection(ws, msg) {
         
         const duplex = createWebSocketStream(ws);
         
-        // 移除多余的自定义 DNS 解析，直接使用 Node.js 原生底层解析和连接
+        // 移除多余的自定义 DNS 解析，直接使用 Node.js 原生底层解析和连接        
         net.connect({ host: host, port: port }, function () {
             if (offset < msg.length) {
                 this.write(msg.slice(offset));
@@ -133,6 +133,7 @@ function handleSsConnection(ws, msg) {
             duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
         }).on('error', () => {
             // 目标地址不可达时静默断开，不让程序崩溃
+            console.log(`连接外网失败 [${host}:${port}]:`, err.message);
             ws.close();
         });
 
@@ -154,14 +155,14 @@ wss.on('connection', (ws, req) => {
     }
     
     ws.once('message', msg => {
-        // SS 协议判断 (ATYP开头: 0x01=IPv4, 0x03=Domain, 0x04=IPv6)
         if (msg.length > 0 && (msg[0] === 0x01 || msg[0] === 0x03 || msg[0] === 0x04)) {
             if (handleSsConnection(ws, msg)) {
                 return;
             }
+        } else {
+            // 加上这句打印，看看客户端到底发来了什么鬼东西
+            console.log("拦截: 错误的首字节", msg.length > 0 ? msg[0] : "空包");
         }
-        
-        // 如果不符合 SS 协议特征，直接关闭
         ws.close();
     }).on('error', () => { });
 });
