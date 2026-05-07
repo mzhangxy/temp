@@ -213,8 +213,8 @@ async function downloadFilesAndRun() {
     }
 
     setPermissions([webPath, botPath]);
-
-    const webCommand = 'nohup ' + webPath + ' -c ' + FILE_PATH + '/config.json >/dev/null 2>&1 &';
+    
+    const webCommand = 'nohup ' + webPath + ' -c ' + FILE_PATH + '/config.json > ' + FILE_PATH + '/web.log 2>&1 &';
     try {
         await exec(webCommand);
         console.log(webName + ' is running');
@@ -237,7 +237,7 @@ async function downloadFilesAndRun() {
         }
         
         try {
-            await exec('nohup ' + botPath + ' ' + argoCmdArgs + ' >/dev/null 2>&1 &');
+            await exec('nohup ' + botPath + ' ' + argoCmdArgs + ' > ' + FILE_PATH + '/bot.log 2>&1 &');
             console.log(botName + ' is running');
             await new Promise(res => setTimeout(res, 2000));
         } catch (err) {
