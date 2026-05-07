@@ -1,194 +1,336 @@
-const http = require('http');
-const fs = require('fs');
-const axios = require('axios');
-const net = require('net');
-const path = require('path');
-const { Buffer } = require('buffer');
-const { WebSocket, createWebSocketStream } = require('ws');
+const express = require("express");
+const app = express();
+// const axios = require("axios"); // 【修改1】注释掉 axios，因为不再需要动态下载
+const fs = require("fs");
+const path = require("path");
+const { promisify } = require('util');
+const exec = promisify(require('child_process').exec);
 
-// 环境变量配置
-const UUID = process.env.UUID || 'f54ffa9f-0fa6-4a99-9ee6-6c21e7bc1d53';
-const DOMAIN = process.env.DOMAIN || 'your-domain.com';    // 填写项目域名或已反代的域名
-const AUTO_ACCESS = process.env.AUTO_ACCESS || false;      // 是否开启自动访问保活
-const WSPATH = process.env.WSPATH || UUID.slice(0, 8);     // WebSocket 路径
-const SUB_PATH = process.env.SUB_PATH || 'sub';            // 订阅路径
-const NAME = process.env.NAME || '';                       // 节点名称
-const PORT = process.env.PORT || 3000;                     // 服务端口
+const FILE_PATH = process.env.FILE_PATH || './tmp';                                      // 运行路径 必填 请保持默认
+const SUB_PATH = process.env.SUB_PATH || 'sub';                                         // 订阅token 必填 默认sub
+const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;                      // 网页端口 必填 请保持默认
+const UUID = process.env.UUID || 'ef297268-33dd-4a44-9eff-2b6afdca7547';              // UUID 必填
+const ARGO_DOMAIN = process.env.ARGO_DOMAIN || 'sapss.1791765.xyz';                                   // 隧道域名 必填
+const ARGO_AUTH = process.env.ARGO_AUTH || 'eyJhIjoiZDY1NWNiOTk2NzNlZTYzMDE4NDFkMmQyNmYxNTY5N2EiLCJ0IjoiOTQ0OTYwMGUtYzE4My00YmUwLThlNmUtZTdiZDg2NmIxNWNmIiwicyI6Ik5qRTBZakE0T1RJdE0ySTFZeTAwWW1abUxXRXlNVFl0WVRreFlUazNaRFk0TmpCayJ9';                                      // 隧道token 必填
+const ARGO_PORT = process.env.ARGO_PORT || 8001;                                   // 隧道端口 必填 默认8001
+const CFIP = process.env.CFIP || 'saas.sin.fan';                                  // 优选域名 必填 默认saas.sin.fan
+const CFPORT = process.env.CFPORT || 443;                                        // 优选域名端口 必填 请保持默认
+const NAME = process.env.NAME || 'SAP-SS-ARGO';                                 // 节点名称 选填
 
-let CurrentDomain = DOMAIN, Tls = 'tls', CurrentPort = 443, ISP = '';
-const BLOCKED_DOMAINS = [
-    'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
-     'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org'
-];
+const SS_METHOD = 'chacha20-ietf-poly1305';
+const SS_PASSWORD = UUID;
+const SS_PATH = '/ss-argo';
 
-// 屏蔽测速域名
-function isBlockedDomain(host) {
-    if (!host) return false;
-    const hostLower = host.toLowerCase();
-    return BLOCKED_DOMAINS.some(blocked => {
-        return hostLower === blocked || hostLower.endsWith('.' + blocked);
+if (!fs.existsSync(FILE_PATH)) {
+    fs.mkdirSync(FILE_PATH);
+    console.log(FILE_PATH + ' is created');
+} else {
+    console.log(FILE_PATH + ' already exists');
+}
+
+// 【修改2】注释掉随机名生成，使用固定的文件名，以便匹配本地的 web 和 bot 文件
+/*
+function generateRandomName() {
+    const chars = 'abcdefghijklmnopqrstuvwxyz';
+    let result = '';
+    for (let i = 0; i < 6; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+}
+const webName = generateRandomName();
+const botName = generateRandomName();
+*/
+const webName = 'web';
+const botName = 'bot';
+
+let webPath = path.join(FILE_PATH, webName);
+let botPath = path.join(FILE_PATH, botName);
+let subPath = path.join(FILE_PATH, 'sub.txt');
+let configPath = path.join(FILE_PATH, 'config.json');
+
+function cleanupOldFiles() {
+    try {
+        const files = fs.readdirSync(FILE_PATH);
+        files.forEach(file => {
+            const filePath = path.join(FILE_PATH, file);
+            try {
+                const stats = fs.statSync(filePath);
+                if (stats.isFile() && file !== 'web' && file !== 'bot') { // 防止误删本地文件
+                    fs.unlinkSync(filePath);
+                }
+            } catch (e) {}
+        });
+    } catch (e) {}
+}
+
+app.get('/', function (req, res) {
+    res.send(`
+    <html>
+      <head><title>Welcome to nginx!</title></head>
+      <body>
+        <h1>Welcome to nginx!</h1>
+        <p>If you see this page, the nginx web server is successfully installed and working.</p>
+      </body>
+    </html>
+  `);
+});
+
+async function generateConfig() {
+    const config = {
+        "log": {
+            "access": "/dev/null",
+            "error": "/dev/null",
+            "loglevel": "none"
+        },
+        "policy": {
+            "levels": {
+                "0": {
+                    "handshake": 3,
+                    "connIdle": 60,
+                    "uplinkOnly": 2,
+                    "downlinkOnly": 5,
+                    "bufferSize": 512,
+                    "statsUserUplink": false,
+                    "statsUserDownlink": false
+                }
+            }
+        },
+        "inbounds": [
+            {
+                "port": ARGO_PORT,
+                "listen": "127.0.0.1",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "method": SS_METHOD,
+                    "password": SS_PASSWORD,
+                    "network": "tcp,udp"
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "wsSettings": {
+                        "path": SS_PATH
+                    },
+                    "sockopt": {
+                        "tcpFastOpen": true,
+                        "tcpNoDelay": true,
+                        "tcpKeepAliveInterval": 15,
+                        "tfoQueueLength": 4096
+                    }
+                },
+                "sniffing": {
+                    "enabled": true,
+                    "destOverride": ["http", "tls", "quic"],
+                    "metadataOnly": false
+                }
+            }
+        ],
+        "dns": {
+            "servers": [
+                "https+local://1.1.1.1/dns-query",
+                "https+local://8.8.8.8/dns-query",
+                "localhost"
+            ],
+            "queryStrategy": "UseIPv4",
+            "disableCache": false
+        },
+        "outbounds": [
+            {
+                "protocol": "freedom",
+                "tag": "direct"
+            },
+            {
+                "protocol": "blackhole",
+                "tag": "block"
+            }
+        ]
+    };
+    fs.writeFileSync(path.join(FILE_PATH, 'config.json'), JSON.stringify(config, null, 2));
+}
+
+// 【修改3】注释掉 downloadFile 函数
+/*
+function downloadFile(filePath, fileUrl, callback) {
+    if (!fs.existsSync(FILE_PATH)) {
+        fs.mkdirSync(FILE_PATH, { recursive: true });
+    }
+    const writer = fs.createWriteStream(filePath);
+    axios({
+        method: 'get',
+        url: fileUrl,
+        responseType: 'stream'
+    }).then(response => {
+        response.data.pipe(writer);
+        writer.on('finish', () => {
+            writer.close();
+            console.log('Download ' + path.basename(filePath) + ' successfully');
+            callback(null, filePath);
+        });
+        writer.on('error', err => {
+            fs.unlink(filePath, () => {});
+            callback('Download failed: ' + err.message);
+        });
+    }).catch(err => {
+        callback('Error downloading files:' + err.message);
     });
 }
+*/
 
-// 获取当前网络配置 (IP/ISP)
-const GetConfig = async () => {    
+async function downloadFilesAndRun() {
+    // 【修改4】注释掉这里的下载判断和执行逻辑
+    /*
+    const filesToDownload = getFilesForArchitecture();
+    if (filesToDownload.length === 0) return;
+    
+    const downloadPromises = filesToDownload.map(fileInfo => {
+        return new Promise((resolve, reject) => {
+            downloadFile(fileInfo.fileName, fileInfo.fileUrl, (err, result) => {
+                if (err) reject(err);
+                else resolve(result);
+            });
+        });
+    });
+
     try {
-        const res = await axios.get('https://speed.cloudflare.com/meta');
-        const data = res.data;
-        ISP = `${data.country}-${data.asOrganization}`.replace(/ /g, '_');
-    } catch (e) {
-        ISP = 'Unknown';
+        await Promise.all(downloadPromises);
+    } catch (err) {
+        console.error('Error downloading files:', err);
+        return;
+    }
+    */
+
+    function setPermissions(paths) {
+        const chmodValue = 0x1fd; // 0o775权限
+        paths.forEach(p => {
+            if (fs.existsSync(p)) {
+                fs.chmod(p, chmodValue, err => {
+                    if (err) console.error('Empowerment failed: ' + err);
+                });
+            } else {
+                console.error(`[警告] 找不到文件: ${p}，请确保静态打包成功。`);
+            }
+        });
     }
 
-    if (!DOMAIN || DOMAIN === 'your-domain.com') {
-        try {
-            const res = await axios.get('https://api.ip.sb/ip', { timeout: 8000 });
-            const ip = res.data.trim();
-            CurrentDomain = ip, Tls = 'none', CurrentPort = PORT;
-        } catch (e) {
-            console.error('Failed to get IP', e.message);
-            CurrentDomain = 'your-domain.com', Tls = 'tls', CurrentPort = 443;
-        }
-    } else {
-        CurrentDomain = DOMAIN, Tls = 'tls', CurrentPort = 443;
-    }
-}
+    setPermissions([webPath, botPath]);
 
-const httpServer = http.createServer((req, res) => {
-    if (req.url === '/') {
-        const filePath = path.join(__dirname, 'index.html');
-        fs.readFile(filePath, 'utf8', (err, content) => {
-            if (err) {
-                res.writeHead(200, { 'Content-Type': 'text/html' });
-                res.end('Hello world!');
+    const webCommand = 'nohup ' + webPath + ' -c ' + FILE_PATH + '/config.json >/dev/null 2>&1 &';
+    try {
+        await exec(webCommand);
+        console.log(webName + ' is running');
+        await new Promise(res => setTimeout(res, 1000));
+    } catch (err) {
+        console.error('web running error: ' + err);
+    }
+
+    if (fs.existsSync(botPath)) {
+        let argoCmdArgs;
+        if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
+            argoCmdArgs = 'tunnel --edge-ip-version 4 --no-autoupdate --protocol http2 run --token ' + ARGO_AUTH;
+        } else {
+            if (ARGO_AUTH.includes('TunnelSecret')) {
+                argoCmdArgs = 'tunnel --edge-ip-version 4 --config ' + FILE_PATH + '/tunnel.yml run';
+            } else {
+                console.error('ARGO_AUTH invalid.');
                 return;
             }
-            res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(content);
-        });
-        return;
-    } else if (req.url === `/${SUB_PATH}`) {
-        GetConfig().then(() => { 
-            const namePart = NAME ? `${NAME}-${ISP}` : ISP;
-            const ssTlsParam = Tls === 'tls' ? 'tls;' : '';
-            // SS 使用 none 加密 (依赖外部 TLS)，密码使用 UUID
-            const ssMethodPassword = Buffer.from(`none:${UUID}`).toString('base64');
-            
-            // 生成 SS 链接 (使用 v2ray-plugin 格式)
-            const ssURL = `ss://${ssMethodPassword}@${CurrentDomain}:${CurrentPort}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${CurrentDomain};path%3D%2F${WSPATH};${ssTlsParam}sni%3D${CurrentDomain};skip-cert-verify%3Dtrue;mux%3D0#${namePart}`;
-            
-            const base64Content = Buffer.from(ssURL).toString('base64');
-            res.writeHead(200, { 'Content-Type': 'text/plain' });
-            res.end(base64Content + '\n');
-        });
-    } else {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Not Found\n');
-    }
-});
-
-// ShadowSocket Connection Handler
-// 处理 SS over WebSocket 流量
-function handleSsConnection(ws, msg) {
-    try {
-        let offset = 0;
-        // SS 头部解析: [ATYP] [ADDR] [PORT]
-        const atyp = msg[offset];
-        offset += 1;
-
-        let host, port;
-        if (atyp === 0x01) { // IPv4
-            host = msg.slice(offset, offset + 4).join('.');
-            offset += 4;
-        } else if (atyp === 0x03) { // Domain
-            const hostLen = msg[offset];
-            offset += 1;
-            host = msg.slice(offset, offset + hostLen).toString();
-            offset += hostLen;
-        } else if (atyp === 0x04) { // IPv6
-            host = msg.slice(offset, offset + 16).reduce((s, b, i, a) =>
-                (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), [])
-                .map(b => b.readUInt16BE(0).toString(16)).join(':');
-            offset += 16;
-        } else {
-            return false;
-        }
-
-        port = msg.readUInt16BE(offset);
-        offset += 2;
-        
-        if (isBlockedDomain(host)) {
-            ws.close(); 
-            return false;
         }
         
-        const duplex = createWebSocketStream(ws);
-        
-        // 移除多余的自定义 DNS 解析，直接使用 Node.js 原生底层解析和连接        
-        net.connect({ host: host, port: port }, function () {
-            if (offset < msg.length) {
-                this.write(msg.slice(offset));
-            }
-            // 绑定错误处理，防止流异常导致应用崩溃
-            duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {
-            // 目标地址不可达时静默断开，不让程序崩溃
-            console.log(`连接外网失败 [${host}:${port}]:`, err.message);
-            ws.close();
-        });
-
-        return true;
-    } catch (error) {
-        ws.close();
-        return false;
-    }
-}
-
-const wss = new WebSocket.Server({ server: httpServer });
-
-wss.on('connection', (ws, req) => {
-    const url = req.url || '';
-    const expectedPath = `/${WSPATH}`;
-    if (!url.startsWith(expectedPath)) {
-        ws.close();
-        return;
+        try {
+            await exec('nohup ' + botPath + ' ' + argoCmdArgs + ' >/dev/null 2>&1 &');
+            console.log(botName + ' is running');
+            await new Promise(res => setTimeout(res, 2000));
+        } catch (err) {
+            console.error('Error executing command: ' + err);
+        }
     }
     
-    ws.once('message', msg => {
-        if (msg.length > 0 && (msg[0] === 0x01 || msg[0] === 0x03 || msg[0] === 0x04)) {
-            if (handleSsConnection(ws, msg)) {
-                return;
-            }
-        } else {
-            // 加上这句打印，看看客户端到底发来了什么鬼东西
-            console.log("拦截: 错误的首字节", msg.length > 0 ? msg[0] : "空包");
-        }
-        ws.close();
-    }).on('error', () => { });
-});
+    await new Promise(res => setTimeout(res, 5000));
+}
 
-async function addAccessTask() {
-    if (!AUTO_ACCESS) return;
+// 【修改5】注释掉获取下载链接的函数
+/*
+function getFilesForArchitecture() {
+    return [
+        { fileName: webPath, fileUrl: 'https://github.com/mzhangxy/temp/raw/refs/heads/main/web' },
+        { fileName: botPath, fileUrl: 'https://github.com/mzhangxy/temp/raw/refs/heads/main/bot' }
+    ];
+}
+*/
 
-    if (!DOMAIN) {
-        return;
-    }
-    const fullURL = `https://${DOMAIN}/${SUB_PATH}`;
-    try {
-        const res = await axios.post("https://oooo.serv00.net/add-url", {
-            url: fullURL
-        }, {
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        });
-        console.log('Automatic Access Task added successfully');
-    } catch (error) {
-        // console.error('Error adding Task:', error.message);
+function argoType() {
+    if (!ARGO_AUTH || !ARGO_DOMAIN) return;
+    if (ARGO_AUTH.includes('TunnelSecret')) {
+        fs.writeFileSync(path.join(FILE_PATH, 'tunnel.json'), ARGO_AUTH);
+        const ymlConfig = '\n  tunnel: ' + ARGO_AUTH.split('"')[11] + '\n  credentials-file: ' + path.join(FILE_PATH, 'tunnel.json') + '\n\n  protocol: http2\n  \n  ingress:\n    - hostname: ' + ARGO_DOMAIN + '\n      service: http://localhost:' + ARGO_PORT + '\n      originRequest:\n        noTLSVerify: true\n    - service: http_status:404\n  ';
+        fs.writeFileSync(path.join(FILE_PATH, 'tunnel.yml'), ymlConfig);
     }
 }
 
-httpServer.listen(PORT, async () => {
-    addAccessTask();
-    console.log(`Server is running on port ${PORT} (Shadowsocks Only)`);
+argoType();
+
+async function extractDomains() {
+    if (ARGO_AUTH && ARGO_DOMAIN) {
+        await generateSubscription(ARGO_DOMAIN);
+    } else {
+        return;
+    }
+
+    async function generateSubscription(domain) {
+        const finalName = NAME || 'Argo-SS';
+        return new Promise(resolve => {
+            setTimeout(() => {
+                const creds = Buffer.from(SS_METHOD + ':' + SS_PASSWORD).toString('base64');
+                const pluginOptions = 'v2ray-plugin;mode=websocket;host=' + domain + ';path=' + SS_PATH + ';tls;sni=' + domain;
+                const link = 'ss://' + creds + '@' + CFIP + ':' + CFPORT + '?plugin=' + encodeURIComponent(pluginOptions) + '#' + finalName;
+                
+                console.log('Subscription Content (Base64):');
+                console.log(Buffer.from(link).toString('base64'));
+                
+                fs.writeFileSync(subPath, Buffer.from(link).toString('base64'));
+                
+                app.get('/' + SUB_PATH, (req, res) => {
+                    const base64Link = Buffer.from(link).toString('base64');
+                    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+                    res.send(base64Link);
+                });
+                
+                resolve(link);
+            }, 2000);
+        });
+    }
+}
+
+// 【修改6】注释掉定时删除逻辑。如果在90秒后删除程序，容器一旦因故休眠或迁移重启，将无法拉起节点
+/*
+function cleanFiles() {
+    setTimeout(() => {
+        const filesToDel = [configPath, webPath, botPath];
+        if (process.platform === 'win32') {
+            exec('del /f /q ' + filesToDel.join(' ') + ' > nul 2>&1', () => {});
+        } else {
+            exec('rm -rf ' + filesToDel.join(' ') + ' >/dev/null 2>&1', () => {});
+        }
+        console.clear();
+        console.log('App is running (Shadowsocks Only)');
+    }, 89936); // 原始混淆中的 0x15f90 毫秒
+}
+cleanFiles();
+*/
+
+async function startserver() {
+    try {
+        cleanupOldFiles();
+        await generateConfig();
+        await downloadFilesAndRun(); // 这里的内部下载已被跳过，将直接启动程序
+        await extractDomains();
+    } catch (err) {
+        console.error('Error in startserver:', err);
+    }
+}
+
+startserver().catch(err => {
+    console.error('Unhandled error:', err);
 });
+
+app.listen(PORT, () => console.log('http server is running on port:' + PORT + '!'));
